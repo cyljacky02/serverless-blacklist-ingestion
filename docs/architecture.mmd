@@ -1,0 +1,27 @@
+flowchart LR
+    A["EventBridge Scheduler<br/>or manual start"] --> B["Step Functions<br/>blacklist-ingestion-workflow"]
+
+    B --> C["AcquireWorkflowLock Lambda"]
+    C --> D["DynamoDB<br/>SourceStateTable<br/>source cache + lock + latest pointer"]
+
+    B --> E["CollectSources Map"]
+    E --> F["CollectSource Lambda<br/>5 upstream feeds"]
+    F --> D
+    F --> G["S3 raw/<source>/<run_id>"]
+    F --> H["S3 normalized/<source>/<run_id>"]
+
+    B --> I["ReduceCollectionResults Lambda"]
+    B --> J["MergeCurated Lambda<br/>partition + diff"]
+    J --> K["S3 curated/runs/<run_id>/*"]
+
+    B --> L["SyncLookupIndex Lambda<br/>delta or rebuild"]
+    L --> M["DynamoDB<br/>LookupIndexTable"]
+
+    B --> N["PublishLatest Lambda"]
+    N --> D
+    N --> O["S3 curated/latest/manifest.json"]
+
+    B --> P["ReleaseWorkflowLock Lambda"]
+
+    Q["API Gateway REST API<br/>/lookup"] --> R["LookupApi Lambda"]
+    R --> M

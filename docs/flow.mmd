@@ -1,0 +1,19 @@
+flowchart TD
+    A["Trigger<br/>manual or scheduler"] --> B["PrepareRun"]
+    B --> C["AcquireWorkflowLock"]
+    C --> D{"Lock acquired?"}
+    D -->|No| E["Return skipped<br/>run_in_progress"]
+    D -->|Yes| F["CollectSources Map"]
+    F --> G["ReduceCollectionResults"]
+    G --> H{"needs_processing?"}
+    H -->|No| I["Return skipped<br/>all_sources_unchanged"]
+    H -->|Yes| J["MergeCurated<br/>partition normalized inputs<br/>write run manifest"]
+    J --> K["SyncLookupIndex<br/>delta or rebuild"]
+    K --> L["PublishLatest<br/>update latest pointer"]
+    I --> M["ReleaseWorkflowLock"]
+    L --> M
+    F -. failure .-> N["ReleaseWorkflowLock<br/>then fail"]
+    G -. failure .-> N
+    J -. failure .-> N
+    K -. failure .-> N
+    L -. failure .-> N

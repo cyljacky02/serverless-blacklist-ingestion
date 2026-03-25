@@ -1,0 +1,372 @@
+{
+  "Comment": "Blacklist ingestion workflow",
+  "StartAt": "PrepareRun",
+  "States": {
+    "PrepareRun": {
+      "Type": "Pass",
+      "Parameters": {
+        "trigger.$": "$.trigger",
+        "requested_by.$": "$.requested_by",
+        "run_id.$": "$$.Execution.Name",
+        "run_started_at.$": "$$.Execution.StartTime",
+        "workflow_options.$": "$",
+        "sources": [
+          {
+            "source_id": "openphish_community",
+            "display_name": "OpenPhish Community Feed",
+            "kind": "url_feed_txt",
+            "url": "https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt",
+            "format": "txt",
+            "license_url": "https://openphish.com/terms.html",
+            "metadata_url": "https://openphish.com/phishing_feeds.html"
+          },
+          {
+            "source_id": "phishtank_online_valid",
+            "display_name": "PhishTank Verified Online Feed",
+            "kind": "phishtank_csv_gz",
+            "url": "https://data.phishtank.com/data/online-valid.csv.gz",
+            "format": "csv.gz",
+            "license_url": "https://www.phishtank.com/developer_info.php",
+            "metadata_url": "https://www.phishtank.org/developer_info.php"
+          },
+          {
+            "source_id": "tw_165_fake_investment_articles",
+            "display_name": "Taiwan 165 Fake Investment and Gambling Articles",
+            "kind": "tw165_article_json",
+            "url": "https://165.npa.gov.tw/api/article/subclass/3",
+            "format": "json",
+            "license_url": null,
+            "metadata_url": "https://165.npa.gov.tw/#/articles/subclass/3"
+          },
+          {
+            "source_id": "tw_165_stopped_domains",
+            "display_name": "Taiwan 165 Stopped Fraud Domains",
+            "kind": "tw165_stopped_csv",
+            "url": "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/29E8E643-88ED-4952-B21E-BD42A3B7108C/resource/F5DCAD4D-C38A-4783-AB32-CA4D1998C50A/download",
+            "format": "csv",
+            "license_url": "https://data.gov.tw/license",
+            "metadata_url": "https://data.gov.tw/dataset/176455"
+          },
+          {
+            "source_id": "tw_165_fake_investment_sites",
+            "display_name": "Taiwan 165 Fake Investment and Gambling Sites",
+            "kind": "tw165_url_csv",
+            "url": "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/api/dataset/033197D4-70F4-45EB-9FB8-6D83532B999A/resource/FEAA1683-4483-4FDC-B861-BC530789E2AB/download",
+            "format": "csv",
+            "license_url": "https://data.gov.tw/license",
+            "metadata_url": "https://data.gov.tw/dataset/160055"
+          }
+        ]
+      },
+      "ResultPath": "$",
+      "Next": "AcquireWorkflowLock"
+    },
+    "AcquireWorkflowLock": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${AcquireWorkflowLockFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "LockAcquired"
+    },
+    "LockAcquired": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.lock_acquired",
+          "BooleanEquals": true,
+          "Next": "CollectSources"
+        }
+      ],
+      "Default": "RunInProgress"
+    },
+    "RunInProgress": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "trigger.$": "$.trigger",
+        "requested_by.$": "$.requested_by",
+        "run_started_at.$": "$.run_started_at",
+        "lock.$": "$.lock",
+        "skipped": true,
+        "skip_reason": "run_in_progress"
+      },
+      "End": true
+    },
+    "CollectSources": {
+      "Type": "Map",
+      "ItemsPath": "$.sources",
+      "MaxConcurrency": 3,
+      "ItemSelector": {
+        "source.$": "$$.Map.Item.Value",
+        "run_id.$": "$.run_id",
+        "run_started_at.$": "$.run_started_at",
+        "trigger.$": "$.trigger"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "CollectSource",
+        "States": {
+          "CollectSource": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "OutputPath": "$.Payload",
+            "Parameters": {
+              "FunctionName": "${CollectSourceFunctionArn}",
+              "Payload.$": "$"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 4,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.collection_results",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ReleaseLockAfterFailure"
+        }
+      ],
+      "Next": "ReduceCollectionResults"
+    },
+    "ReduceCollectionResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${ReduceCollectionResultsFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ReleaseLockAfterFailure"
+        }
+      ],
+      "Next": "NeedsProcessing"
+    },
+    "NeedsProcessing": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.needs_processing",
+          "BooleanEquals": true,
+          "Next": "MergeCurated"
+        }
+      ],
+      "Default": "NoChanges"
+    },
+    "NoChanges": {
+      "Type": "Pass",
+      "Parameters": {
+        "run_id.$": "$.run_id",
+        "trigger.$": "$.trigger",
+        "requested_by.$": "$.requested_by",
+        "run_started_at.$": "$.run_started_at",
+        "lookup_sync_mode.$": "$.lookup_sync_mode",
+        "force_merge.$": "$.force_merge",
+        "changed_count.$": "$.changed_count",
+        "collection_results.$": "$.collection_results",
+        "collection_summary.$": "$.collection_summary",
+        "skipped": true,
+        "skip_reason": "all_sources_unchanged"
+      },
+      "Next": "ReleaseLockSuccess"
+    },
+    "MergeCurated": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${MergeCuratedFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ReleaseLockAfterFailure"
+        }
+      ],
+      "Next": "SyncLookupIndex"
+    },
+    "SyncLookupIndex": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${SyncLookupIndexFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ReleaseLockAfterFailure"
+        }
+      ],
+      "Next": "PublishLatest"
+    },
+    "PublishLatest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${PublishLatestFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ReleaseLockAfterFailure"
+        }
+      ],
+      "Next": "ReleaseLockSuccess"
+    },
+    "ReleaseLockSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${ReleaseWorkflowLockFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    },
+    "ReleaseLockAfterFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "OutputPath": "$.Payload",
+      "Parameters": {
+        "FunctionName": "${ReleaseWorkflowLockFunctionArn}",
+        "Payload.$": "$"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "WorkflowFailed"
+    },
+    "WorkflowFailed": {
+      "Type": "Fail",
+      "Error": "IngestionWorkflowFailed",
+      "Cause": "Blacklist ingestion processing failed after lock acquisition."
+    }
+  }
+}

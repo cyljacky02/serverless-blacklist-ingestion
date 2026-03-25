@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless blacklist ingestion pipeline for OpenPhish, PhishTank, and Taiwan 165
+  datasets. Deploys S3, DynamoDB, Lambda functions, a Step Functions workflow,
+  and an EventBridge Scheduler trigger.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: blacklist-ingestion
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+    Description: Short project slug used in resource names and tags.
+  ScheduleExpression:
+    Type: String
+    Default: "cron(0 3,15 * * ? *)"
+    Description: EventBridge Scheduler expression for recurring ingestion runs.
+  ScheduleTimezone:
+    Type: String
+    Default: Asia/Taipei
+    Description: IANA timezone used to evaluate ScheduleExpression.
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Whether the recurring scheduler starts enabled.
+  PhishTankAppKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      Optional PhishTank application key. If omitted, the public downloadable feed
+      is used and should be scheduled conservatively.
+  ExistingArtifactsBucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional existing shared S3 bucket name. Leave blank to let this stack create
+      and manage a dedicated artifacts bucket.
+  LambdaTracingMode:
+    Type: String
+    Default: PassThrough
+    AllowedValues:
+      - Active
+      - PassThrough
+      - Disabled
+    Description: X-Ray tracing mode applied to Lambda functions in this stack.
+  LambdaLogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: CloudWatch Logs retention for Lambda log groups.
+
+Conditions:
+  UseExistingArtifactsBucket: !Not [!Equals [!Ref ExistingArtifactsBucketName, ""]]
+  CreateManagedArtifactsBucket: !Equals [!Ref ExistingArtifactsBucketName, ""]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 180
+    MemorySize: 512
+    Tracing: !Ref LambdaTracingMode
+    Environment:
+      Variables:
+        ARTIFACTS_BUCKET: !If
+          - UseExistingArtifactsBucket
+          - !Ref ExistingArtifactsBucketName
+          - !Ref ArtifactsBucket
+        STATE_TABLE: !Ref SourceStateTable
+        LOOKUP_TABLE: !Ref LookupIndexTable
+        RAW_PREFIX: raw
+        NORMALIZED_PREFIX: normalized
+        CURATED_PREFIX: curated
+        PHISHTANK_APP_KEY: !Ref PhishTankAppKey
+        DEFAULT_USER_AGENT: !Sub "${ProjectName}/0.1 (+https://github.com/openai/codex)"
+        CURATED_SCHEMA_VERSION: "2"
+        LOOKUP_SCHEMA_VERSION: "2"
+        MERGE_PARTITION_COUNT: "16"
+        INGESTION_LOCK_LEASE_SECONDS: "900"
+    Tags:
+      project: !Ref ProjectName
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateManagedArtifactsBucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawPayloads
+            Status: Enabled
+            Prefix: raw/
+            ExpirationInDays: 30
+          - Id: ExpireNormalizedPayloads
+            Status: Enabled
+            Prefix: normalized/
+            ExpirationInDays: 90
+          - Id: ExpireCuratedRunArtifacts
+            Status: Enabled
+            Prefix: curated/runs/
+            ExpirationInDays: 90
+      Tags:
+        - Key: project
+          Value: !Ref ProjectName
+
+  SourceStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: source_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: source_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: project
+          Value: !Ref ProjectName
+
+  LookupIndexTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: indicator_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: indicator_key
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: project
+          Value: !Ref ProjectName
+
+  AcquireWorkflowLockFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: acquire_workflow_lock.handler
+      Description: Acquire a short-lived DynamoDB lease for the ingestion workflow.
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SourceStateTable
+
+  ReleaseWorkflowLockFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: release_workflow_lock.handler
+      Description: Release the DynamoDB lease for the ingestion workflow.
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SourceStateTable
+
+  ReduceCollectionResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: reduce_collection_results.handler
+      Description: Summarize collection results and decide whether downstream processing is required.
+      Timeout: 30
+
+  CollectSourceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: collect_source.handler
+      Description: Download, normalize, and persist one blacklist source.
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !If
+              - UseExistingArtifactsBucket
+              - !Ref ExistingArtifactsBucketName
+              - !Ref ArtifactsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SourceStateTable
+
+  MergeCuratedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: merge_curated.handler
+      Description: Build immutable curated artifacts for the current ingestion run.
+      Timeout: 600
+      MemorySize: 2048
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !If
+              - UseExistingArtifactsBucket
+              - !Ref ExistingArtifactsBucketName
+              - !Ref ArtifactsBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref SourceStateTable
+
+  SyncLookupIndexFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: sync_lookup_index.handler
+      Description: Sync the combined blacklist view into the lookup index table.
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !If
+              - UseExistingArtifactsBucket
+              - !Ref ExistingArtifactsBucketName
+              - !Ref ArtifactsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LookupIndexTable
+
+  PublishLatestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: publish_latest.handler
+      Description: Publish the current curated run as latest after lookup sync succeeds.
+      Timeout: 30
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !If
+              - UseExistingArtifactsBucket
+              - !Ref ExistingArtifactsBucketName
+              - !Ref ArtifactsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SourceStateTable
+
+  BlacklistLookupApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+
+  LookupApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: lookup_api.handler
+      Description: Exact-match blacklist lookup API backed by DynamoDB.
+      Timeout: 30
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref LookupIndexTable
+      Events:
+        LookupGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BlacklistLookupApi
+            Path: /lookup
+            Method: GET
+        LookupPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref BlacklistLookupApi
+            Path: /lookup
+            Method: POST
+
+  AcquireWorkflowLockFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AcquireWorkflowLockFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  ReleaseWorkflowLockFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ReleaseWorkflowLockFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  ReduceCollectionResultsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ReduceCollectionResultsFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  CollectSourceFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CollectSourceFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  MergeCuratedFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MergeCuratedFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  SyncLookupIndexFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SyncLookupIndexFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  PublishLatestFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PublishLatestFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  LookupApiFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LookupApiFunction}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+
+  IngestionWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${ProjectName}-workflow"
+      Type: STANDARD
+      DefinitionUri: statemachine/ingestion.asl.json
+      DefinitionSubstitutions:
+        AcquireWorkflowLockFunctionArn: !GetAtt AcquireWorkflowLockFunction.Arn
+        ReleaseWorkflowLockFunctionArn: !GetAtt ReleaseWorkflowLockFunction.Arn
+        ReduceCollectionResultsFunctionArn: !GetAtt ReduceCollectionResultsFunction.Arn
+        CollectSourceFunctionArn: !GetAtt CollectSourceFunction.Arn
+        MergeCuratedFunctionArn: !GetAtt MergeCuratedFunction.Arn
+        SyncLookupIndexFunctionArn: !GetAtt SyncLookupIndexFunction.Arn
+        PublishLatestFunctionArn: !GetAtt PublishLatestFunction.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AcquireWorkflowLockFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReleaseWorkflowLockFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReduceCollectionResultsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CollectSourceFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MergeCuratedFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SyncLookupIndexFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PublishLatestFunction
+      Events:
+        ScheduledRun:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub "${ProjectName}-schedule"
+            Description: Recurring blacklist ingestion workflow trigger.
+            ScheduleExpression: !Ref ScheduleExpression
+            ScheduleExpressionTimezone: !Ref ScheduleTimezone
+            State: !Ref ScheduleState
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            Input: '{"trigger":"scheduler","requested_by":"sam-schedule"}'
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 3600
+              MaximumRetryAttempts: 3
+            DeadLetterConfig:
+              Type: SQS
+              QueueLogicalId: IngestionScheduleDlq
+
+Outputs:
+  ArtifactsBucketName:
+    Description: S3 bucket containing raw, normalized, and curated blacklist artifacts.
+    Value: !If
+      - UseExistingArtifactsBucket
+      - !Ref ExistingArtifactsBucketName
+      - !Ref ArtifactsBucket
+  ArtifactsBucketManagedByStack:
+    Description: Whether this stack created and manages the artifacts bucket.
+    Value: !If
+      - UseExistingArtifactsBucket
+      - "false"
+      - "true"
+  SourceStateTableName:
+    Description: DynamoDB table that stores source ETag and latest artifact pointers.
+    Value: !Ref SourceStateTable
+  LookupIndexTableName:
+    Description: DynamoDB table that stores the exact-match blacklist lookup index.
+    Value: !Ref LookupIndexTable
+  IngestionWorkflowArn:
+    Description: Step Functions state machine ARN for manual executions.
+    Value: !GetAtt IngestionWorkflow.Arn
+  LookupApiUrl:
+    Description: HTTP API endpoint for blacklist lookups.
+    Value: !Sub "https://${BlacklistLookupApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/lookup"
