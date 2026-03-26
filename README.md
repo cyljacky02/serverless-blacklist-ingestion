@@ -70,8 +70,10 @@ For this stack, SAM is the shortest path to a fully deployable template while ke
   - diffs each partition against the previously published run manifest
 - `SyncLookupIndex` consumes the run manifest directly:
   - delta mode applies run-scoped `new` / `changed` / `removed` partitions
-  - rebuild mode rewrites every current combined record and removes stale or legacy lookup rows
-- `PublishLatest` advances `curated/latest/manifest.json` and the `__meta__#curated_latest` state-table item only after lookup sync succeeds.
+  - rebuild mode rewrites every current combined record and removes stale or legacy lookup rows with a strong-consistent projected cleanup sweep
+- `PublishLatest` runs only after lookup sync succeeds:
+  - `__meta__#curated_latest` in DynamoDB is the authoritative latest-published pointer
+  - `curated/latest/manifest.json` is a derived convenience pointer that is refreshed best-effort from the same data
 - Lookup metadata is stored in the same DynamoDB table under `indicator_key="__meta__#lookup_index"`.
 
 ## Sources in v1
@@ -164,7 +166,7 @@ The workflow publishes two control-plane metadata records:
 - `SourceStateTable`, `source_id="__meta__#curated_latest"`
   - `run_id`: the currently published curated run
   - `manifest_key`: the immutable run manifest under `curated/runs/<run_id>/manifest.json`
-  - `published_at`: when `PublishLatest` advanced the pointer
+  - `published_at`: when `PublishLatest` advanced the authoritative DynamoDB pointer
   - `schema_version`: curated artifact schema version
   - `combined_record_count`, `delta_counts`, `source_count`: summary of the published run
 
@@ -179,8 +181,8 @@ The workflow publishes two control-plane metadata records:
 ### Interpretation
 
 - Healthy publish:
-  - `__meta__#curated_latest.run_id` points at the newest successfully published run
-  - `curated/latest/manifest.json` points at the same `manifest_key`
+  - `__meta__#curated_latest.run_id` points at the newest successfully published run and is the source of truth
+  - `curated/latest/manifest.json` usually points at the same `manifest_key`, but it is derived state and can be repaired if a transient S3 write fails
   - `__meta__#lookup_index.manifest_key` matches the published run manifest for the latest successful sync
 
 - Healthy rebuild:
@@ -193,24 +195,26 @@ The workflow publishes two control-plane metadata records:
   - `skip_reason` should be `run_in_progress`
   - the output `lock.current_owner_run_id` identifies the run that currently owns the lease
 
-If a run fails before `PublishLatest`, the latest pointer must not advance. In that case, inspect the failed execution, then compare `__meta__#curated_latest.run_id` against the failed run ID before retrying.
+If a run fails before `PublishLatest`, the authoritative latest pointer must not advance. In that case, inspect the failed execution, then compare `__meta__#curated_latest.run_id` against the failed run ID before retrying.
+
+If `PublishLatest` succeeds with `published_latest.s3_pointer_written=false`, treat the publish as successful. The authoritative pointer is already stored in DynamoDB; repair `curated/latest/manifest.json` from `__meta__#curated_latest.manifest_key` when convenient.
 
 ## Latest Measured Runtime
 
 Measured on live executions in `ap-east-2` on 2026-03-26 after the run-scoped refactor shipped:
 
-- Manual delta publish run `codex-delta-20260326053305`:
+- Manual delta publish run `blacklist-delta-20260326053305`:
   - `05:32:08` -> `05:34:09` Asia/Taipei, about `121s`
   - `phishtank_online_valid` changed, so the workflow rebuilt the current run artifacts and performed the first post-migration publish
   - output: `combined_record_count=138209`, `delta_counts.new=138209`
-- Manual overlap run `codex-overlap-20260326053350`:
+- Manual overlap run `blacklist-overlap-20260326053350`:
   - `05:33:15` -> `05:33:19` Asia/Taipei, about `4.2s`
   - output: `skipped=true`, `skip_reason="run_in_progress"`
-  - the lock holder recorded in the result was `codex-delta-20260326053305`
-- Manual rebuild run `codex-rebuild-20260326053440`:
+  - the lock holder recorded in the result was `blacklist-delta-20260326053305`
+- Manual rebuild run `blacklist-rebuild-20260326053440`:
   - `05:34:21` -> `05:37:14` Asia/Taipei, about `173s`
   - all five sources short-circuited unchanged, but `lookup_sync_mode="rebuild"` forced merge + full lookup reconciliation
-  - output: `upserted_count=138209`, `deleted_count=48705`, `last_rebuild_run_id=codex-rebuild-20260326053440`
+  - output: `upserted_count=138209`, `deleted_count=48705`, `last_rebuild_run_id=blacklist-rebuild-20260326053440`
 
 Live API validation after rebuild:
 
@@ -362,7 +366,8 @@ The response also includes:
 - PhishTank public downloads should be scheduled conservatively unless you use an application key.
 - The Taiwan 165 article source comes from the official `165.npa.gov.tw` API and currently returns the full article backlog in one JSON response.
 - The Taiwan 165 open-data CSVs update irregularly and may lag or differ from the article feed because they reflect separate publication and stop-resolution workflows.
-- `curated/latest/manifest.json` is now a lightweight pointer to the published run manifest, not the full curated dataset itself.
+- `curated/latest/manifest.json` is now a lightweight derived pointer to the published run manifest, not the full curated dataset itself.
+- `__meta__#curated_latest` in DynamoDB is the authoritative latest-published record.
 - Manual executions can request `lookup_sync_mode="rebuild"` to fully reconcile the lookup table with the current curated run.
 - This stack now supports either:
   - a dedicated bucket created by the stack

@@ -12,6 +12,7 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "handlers"))
 
+import lookup_store  # noqa: E402
 import sync_lookup_index  # noqa: E402
 from common import LOOKUP_METADATA_KEY  # noqa: E402
 
@@ -34,23 +35,52 @@ class FakeBatchWriter:
 
 
 class FakeLookupTable:
-    def __init__(self, items: dict[str, dict] | None = None) -> None:
+    def __init__(self, items: dict[str, dict] | None = None, *, stale_scan_items: dict[str, dict] | None = None) -> None:
         self.items = dict(items or {})
+        self.stale_scan_items = dict(stale_scan_items or self.items)
         self.name = "unit-test-lookup-table"
+        self.scan_calls: list[dict[str, object]] = []
+        self.get_item_calls: list[dict[str, object]] = []
 
     def batch_writer(self, *, overwrite_by_pkeys: list[str]) -> FakeBatchWriter:
         return FakeBatchWriter(self)
 
-    def get_item(self, *, Key: dict) -> dict:  # noqa: N803
+    def get_item(self, *, Key: dict, ConsistentRead: bool = False) -> dict:  # noqa: N803
+        self.get_item_calls.append({"Key": Key, "ConsistentRead": ConsistentRead})
         item = self.items.get(Key["indicator_key"])
         return {"Item": item} if item else {}
 
-    def scan(self, *, Segment: int, TotalSegments: int, ExclusiveStartKey: dict | None = None) -> dict:  # noqa: N803
-        keys = sorted(key for key in self.items if sum(key.encode("utf-8")) % TotalSegments == Segment)
+    def put_item(self, *, Item: dict) -> None:  # noqa: N803
+        self.items[Item["indicator_key"]] = Item
+
+    def scan(  # noqa: N803
+        self,
+        *,
+        Segment: int,
+        TotalSegments: int,
+        ConsistentRead: bool = False,
+        ProjectionExpression: str | None = None,
+        ExclusiveStartKey: dict | None = None,
+    ) -> dict:
+        self.scan_calls.append(
+            {
+                "Segment": Segment,
+                "TotalSegments": TotalSegments,
+                "ConsistentRead": ConsistentRead,
+                "ProjectionExpression": ProjectionExpression,
+                "ExclusiveStartKey": ExclusiveStartKey,
+            }
+        )
+        source = self.items if ConsistentRead else self.stale_scan_items
+        keys = sorted(key for key in source if sum(key.encode("utf-8")) % TotalSegments == Segment)
         if ExclusiveStartKey:
             last_key = ExclusiveStartKey["indicator_key"]
             keys = [key for key in keys if key > last_key]
-        return {"Items": [self.items[key] for key in keys]}
+        items = [dict(source[key]) for key in keys]
+        if ProjectionExpression:
+            allowed = [part.strip() for part in ProjectionExpression.split(",")]
+            items = [{key: value for key, value in item.items() if key in allowed} for item in items]
+        return {"Items": items}
 
 
 def test_sync_lookup_index_delta_mode_uses_manifest_delta_parts(monkeypatch) -> None:
@@ -102,8 +132,8 @@ def test_sync_lookup_index_delta_mode_uses_manifest_delta_parts(monkeypatch) -> 
         ],
     }
 
-    monkeypatch.setattr(sync_lookup_index, "lookup_table", table)
-    monkeypatch.setattr(sync_lookup_index, "iter_gzip_jsonl", lambda key: iter(artifact_records.get(key, [])))
+    monkeypatch.setattr(lookup_store, "lookup_table", table)
+    monkeypatch.setattr(lookup_store, "iter_gzip_jsonl", lambda key: iter(artifact_records.get(key, [])))
 
     result = sync_lookup_index.handler(
         {
@@ -138,22 +168,31 @@ def test_sync_lookup_index_delta_mode_uses_manifest_delta_parts(monkeypatch) -> 
 def test_sync_lookup_index_rebuild_mode_rewrites_and_cleans_stale_rows(monkeypatch) -> None:
     current_key = sync_lookup_index.indicator_lookup_key("domain", "current.example")
     stale_key = sync_lookup_index.indicator_lookup_key("domain", "stale.example")
+    initial_items = {
+        LOOKUP_METADATA_KEY: {
+            "indicator_key": LOOKUP_METADATA_KEY,
+            "last_rebuild_run_id": "old-rebuild",
+        },
+        current_key: {
+            "indicator_key": current_key,
+            "indicator": "current.example",
+            "rebuild_run_id": "old-rebuild",
+        },
+        stale_key: {
+            "indicator_key": stale_key,
+            "indicator": "stale.example",
+            "rebuild_run_id": "old-rebuild",
+        },
+        "domain#legacy.example": {
+            "indicator_key": "domain#legacy.example",
+            "indicator": "legacy.example",
+        },
+    }
     table = FakeLookupTable(
         {
-            LOOKUP_METADATA_KEY: {
-                "indicator_key": LOOKUP_METADATA_KEY,
-                "last_rebuild_run_id": "old-rebuild",
-            },
-            stale_key: {
-                "indicator_key": stale_key,
-                "indicator": "stale.example",
-                "rebuild_run_id": "old-rebuild",
-            },
-            "domain#legacy.example": {
-                "indicator_key": "domain#legacy.example",
-                "indicator": "legacy.example",
-            },
-        }
+            **initial_items,
+        },
+        stale_scan_items=initial_items,
     )
     artifact_records = {
         "combined-00": [
@@ -169,9 +208,9 @@ def test_sync_lookup_index_rebuild_mode_rewrites_and_cleans_stale_rows(monkeypat
         ]
     }
 
-    monkeypatch.setattr(sync_lookup_index, "lookup_table", table)
-    monkeypatch.setattr(sync_lookup_index, "iter_gzip_jsonl", lambda key: iter(artifact_records.get(key, [])))
-    monkeypatch.setattr(sync_lookup_index, "REBUILD_SCAN_SEGMENTS", 2)
+    monkeypatch.setattr(lookup_store, "lookup_table", table)
+    monkeypatch.setattr(lookup_store, "iter_gzip_jsonl", lambda key: iter(artifact_records.get(key, [])))
+    monkeypatch.setattr(lookup_store, "REBUILD_SCAN_SEGMENTS", 2)
 
     result = sync_lookup_index.handler(
         {
@@ -196,3 +235,5 @@ def test_sync_lookup_index_rebuild_mode_rewrites_and_cleans_stale_rows(monkeypat
     assert "domain#legacy.example" not in table.items
     assert table.items[LOOKUP_METADATA_KEY]["last_rebuild_run_id"] == "run-rebuild"
     assert result["lookup_sync"]["sync_mode"] == "rebuild"
+    assert all(call["ConsistentRead"] is True for call in table.scan_calls)
+    assert all(call["ProjectionExpression"] == lookup_store.REBUILD_SCAN_PROJECTION for call in table.scan_calls)

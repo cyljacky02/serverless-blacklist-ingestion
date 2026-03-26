@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 from botocore.exceptions import ClientError
@@ -17,16 +18,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "handlers")
 import acquire_workflow_lock  # noqa: E402
 import release_workflow_lock  # noqa: E402
 from common import INGESTION_LOCK_KEY  # noqa: E402
+import state_store  # noqa: E402
 
 
 class FakeStateTable:
     def __init__(self, items: dict[str, dict] | None = None) -> None:
         self.items = dict(items or {})
 
+    def get_item(self, *, Key: dict, ConsistentRead: bool = False) -> dict:  # noqa: N803
+        item = self.items.get(Key["source_id"])
+        return {"Item": item} if item else {}
+
     def put_item(self, *, Item: dict, ConditionExpression: str, ExpressionAttributeValues: dict) -> None:  # noqa: N803
         existing = self.items.get(Item["source_id"])
         now_epoch = ExpressionAttributeValues[":now_epoch"]
-        if existing and existing.get("lease_expires_at", 0) >= now_epoch:
+        owner_run_id = ExpressionAttributeValues[":owner_run_id"]
+        if (
+            existing
+            and existing.get("lease_expires_at", 0) >= now_epoch
+            and existing.get("owner_run_id") != owner_run_id
+        ):
             raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
         self.items[Item["source_id"]] = Item
 
@@ -39,10 +50,8 @@ class FakeStateTable:
 
 def test_acquire_and_release_workflow_lock(monkeypatch) -> None:
     table = FakeStateTable()
-    monkeypatch.setattr(acquire_workflow_lock, "state_table", table)
-    monkeypatch.setattr(acquire_workflow_lock, "load_source_state", lambda source_id: table.items.get(source_id, {}))
+    monkeypatch.setattr(state_store, "state_table", table)
     monkeypatch.setattr(acquire_workflow_lock, "LOCK_ACQUIRE_ATTEMPTS", 1)
-    monkeypatch.setattr(release_workflow_lock, "state_table", table)
 
     acquired = acquire_workflow_lock.handler({"run_id": "run-1", "trigger": "manual", "requested_by": "test"}, None)
 
@@ -61,15 +70,34 @@ def test_acquire_workflow_lock_returns_skip_signal_when_another_run_holds_it(mon
             INGESTION_LOCK_KEY: {
                 "source_id": INGESTION_LOCK_KEY,
                 "owner_run_id": "run-active",
-                "lease_expires_at": 9999999999,
+                "lease_expires_at": Decimal("9999999999"),
             }
         }
     )
-    monkeypatch.setattr(acquire_workflow_lock, "state_table", table)
-    monkeypatch.setattr(acquire_workflow_lock, "load_source_state", lambda source_id: table.items.get(source_id, {}))
+    monkeypatch.setattr(state_store, "state_table", table)
     monkeypatch.setattr(acquire_workflow_lock, "LOCK_ACQUIRE_ATTEMPTS", 1)
 
     result = acquire_workflow_lock.handler({"run_id": "run-2", "trigger": "manual", "requested_by": "test"}, None)
 
     assert result["lock_acquired"] is False
     assert result["lock"]["current_owner_run_id"] == "run-active"
+
+
+def test_acquire_workflow_lock_is_idempotent_for_same_run_id(monkeypatch) -> None:
+    table = FakeStateTable(
+        {
+            INGESTION_LOCK_KEY: {
+                "source_id": INGESTION_LOCK_KEY,
+                "owner_run_id": "run-1",
+                "lease_expires_at": 9999999999,
+            }
+        }
+    )
+    monkeypatch.setattr(state_store, "state_table", table)
+    monkeypatch.setattr(acquire_workflow_lock, "LOCK_ACQUIRE_ATTEMPTS", 1)
+
+    result = acquire_workflow_lock.handler({"run_id": "run-1", "trigger": "manual", "requested_by": "test"}, None)
+
+    assert result["lock_acquired"] is True
+    assert result["lock"]["owner_run_id"] == "run-1"
+    assert table.items[INGESTION_LOCK_KEY]["owner_run_id"] == "run-1"

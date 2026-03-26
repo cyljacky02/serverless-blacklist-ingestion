@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 from datetime import UTC, datetime
@@ -25,6 +26,11 @@ NORMALIZED_PREFIX = os.environ.get("NORMALIZED_PREFIX", "normalized")
 CURATED_PREFIX = os.environ.get("CURATED_PREFIX", "curated")
 DEFAULT_USER_AGENT = os.environ.get("DEFAULT_USER_AGENT", "blacklist-ingestion/0.1")
 PHISHTANK_APP_KEY = os.environ.get("PHISHTANK_APP_KEY", "").strip()
+SKIP_SOURCE_HOSTS = {
+    host.strip().lower()
+    for host in os.environ.get("SKIP_SOURCE_HOSTS", "").split(",")
+    if host.strip()
+}
 CURATED_SCHEMA_VERSION = int(os.environ.get("CURATED_SCHEMA_VERSION", "2"))
 LOOKUP_SCHEMA_VERSION = int(os.environ.get("LOOKUP_SCHEMA_VERSION", str(CURATED_SCHEMA_VERSION)))
 MERGE_PARTITION_COUNT = int(os.environ.get("MERGE_PARTITION_COUNT", "16"))
@@ -57,7 +63,7 @@ def safe_run_id(value: str) -> str:
 def http_fetch(
     url: str,
     *,
-    timeout_seconds: int = 60,
+    timeout_seconds: int = 120,
     headers: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], bytes, str]:
     request = Request(url, headers=headers or {}, method="GET")
@@ -129,19 +135,27 @@ def iter_gzip_jsonl(key: str) -> Iterator[dict[str, Any]]:
         body.close()
 
 
-def load_source_state(source_id: str) -> dict[str, Any]:
-    response = state_table.get_item(Key={"source_id": source_id})
-    return response.get("Item", {})
+def log_json(logger: logging.Logger, payload: dict[str, Any], *, warning: bool = False) -> None:
+    level = logging.WARNING if warning else logging.INFO
+    logger.log(level, json.dumps(payload, ensure_ascii=True, sort_keys=True))
+
+
+def load_source_state(source_id: str, *, consistent_read: bool = False) -> dict[str, Any]:
+    from state_store import load_source_state as _load_source_state
+
+    return _load_source_state(source_id, consistent_read=consistent_read)
 
 
 def save_source_state(source_id: str, attributes: dict[str, Any]) -> None:
-    item = {"source_id": source_id}
-    item.update(attributes)
-    state_table.put_item(Item=item)
+    from state_store import save_source_state as _save_source_state
+
+    _save_source_state(source_id, attributes)
 
 
-def load_latest_curated_metadata() -> dict[str, Any]:
-    return load_source_state(CURATED_LATEST_META_KEY)
+def load_latest_curated_metadata(*, consistent_read: bool = True) -> dict[str, Any]:
+    from state_store import load_latest_curated_metadata as _load_latest_curated_metadata
+
+    return _load_latest_curated_metadata(consistent_read=consistent_read)
 
 
 def source_raw_key(source_id: str, run_id: str, extension: str) -> str:

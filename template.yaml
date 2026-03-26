@@ -74,11 +74,12 @@ Globals:
         NORMALIZED_PREFIX: normalized
         CURATED_PREFIX: curated
         PHISHTANK_APP_KEY: !Ref PhishTankAppKey
-        DEFAULT_USER_AGENT: !Sub "${ProjectName}/0.1 (+https://github.com/openai/codex)"
+        DEFAULT_USER_AGENT: !Sub "${ProjectName}/0.1 (+https://github.com/cyljacky02/serverless-blacklist-ingestion)"
         CURATED_SCHEMA_VERSION: "2"
         LOOKUP_SCHEMA_VERSION: "2"
         MERGE_PARTITION_COUNT: "16"
         INGESTION_LOCK_LEASE_SECONDS: "900"
+        SKIP_SOURCE_HOSTS: "opdadm.moi.gov.tw"
     Tags:
       project: !Ref ProjectName
 

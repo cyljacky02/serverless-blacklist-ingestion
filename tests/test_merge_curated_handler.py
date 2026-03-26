@@ -88,7 +88,11 @@ def test_merge_curated_handler_builds_partitioned_run_artifacts(monkeypatch) -> 
     stored_objects: dict[str, dict[str, object]] = {}
 
     monkeypatch.setattr(merge_curated, "iter_gzip_jsonl", lambda key: iter(current_records_by_key[key]))
-    monkeypatch.setattr(merge_curated, "load_latest_curated_metadata", lambda: {"manifest_key": "prev-manifest.json"})
+    monkeypatch.setattr(
+        merge_curated,
+        "load_latest_curated_metadata",
+        lambda **kwargs: {"manifest_key": "prev-manifest.json"},
+    )
     monkeypatch.setattr(merge_curated, "load_json_object", lambda key: previous_manifest if key == "prev-manifest.json" else None)
     monkeypatch.setattr(merge_curated, "try_get_object_bytes", lambda key: previous_bytes.get(key))
     monkeypatch.setattr(

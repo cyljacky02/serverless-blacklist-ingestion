@@ -9,21 +9,21 @@ from urllib.parse import urlparse
 
 from common import (
     PHISHTANK_APP_KEY,
+    SKIP_SOURCE_HOSTS,
     build_common_headers,
     csv_rows_from_bytes,
     gzip_jsonl,
     http_fetch,
     json_dumps,
-    load_source_state,
     normalize_domain,
     normalize_url,
     put_object,
-    save_source_state,
     sha256_hex,
     source_normalized_key,
     source_raw_key,
     utc_now_iso,
 )
+from state_store import load_source_state, save_source_state
 
 DATE_RANGE_PATTERN = re.compile(
     r"(?P<start_year>\d{2,3})/(?P<start_month>\d{1,2})/(?P<start_day>\d{1,2})"
@@ -176,6 +176,11 @@ def _effective_url(source: dict[str, Any]) -> str:
     if source["source_id"] != "phishtank_online_valid" or not PHISHTANK_APP_KEY:
         return source["url"]
     return f"https://data.phishtank.com/data/{PHISHTANK_APP_KEY}/online-valid.csv.gz"
+
+
+def _source_should_be_skipped(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").strip().lower()
+    return bool(hostname and hostname in SKIP_SOURCE_HOSTS)
 
 
 def _raw_extension(source: dict[str, Any]) -> str:
@@ -410,6 +415,38 @@ def handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
     state = load_source_state(source_id)
 
     url = _effective_url(source)
+    if _source_should_be_skipped(url):
+        save_source_state(
+            source_id,
+            {
+                **state,
+                "source_id": source_id,
+                "display_name": source["display_name"],
+                "last_checked_at": now,
+                "last_requested_url": url,
+                "last_final_url": url,
+                "source_skip_reason": "configured_host_skip",
+                "source_skip_host": (urlparse(url).hostname or "").strip().lower(),
+                "metadata_url": source["metadata_url"],
+                "license_url": source["license_url"],
+            },
+        )
+        return {
+            "source_id": source_id,
+            "display_name": source["display_name"],
+            "metadata_url": source["metadata_url"],
+            "license_url": source["license_url"],
+            "changed": False,
+            "short_circuit_reason": "source_disabled",
+            "status_code": None,
+            "record_count": state.get("last_record_count", 0),
+            "normalized_key": state.get("last_normalized_key"),
+            "raw_key": state.get("last_raw_key"),
+            "requested_url": url,
+            "final_url": url,
+            "fetched_at": now,
+        }
+
     status_code, headers, body, final_url = http_fetch(url, headers=build_common_headers(state))
 
     if status_code == 304:

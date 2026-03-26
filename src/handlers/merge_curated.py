@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from collection_summary import build_collection_summary as _build_collection_summary
 from common import (
     CURATED_SCHEMA_VERSION,
     curated_run_key,
@@ -15,7 +16,6 @@ from common import (
     iter_gzip_jsonl,
     json_dumps,
     load_json_object,
-    load_latest_curated_metadata,
     partition_ids,
     put_object,
     read_gzip_jsonl,
@@ -23,6 +23,7 @@ from common import (
     try_get_object_bytes,
     utc_now_iso,
 )
+from state_store import load_latest_curated_metadata
 
 
 def _aggregate_partition_records(records: Iterable[dict[str, Any]], *, generated_at: str) -> tuple[list[dict[str, Any]], dict[str, int]]:
@@ -138,45 +139,6 @@ def _compute_delta_records(
         "changed": changed_records,
     }
 
-
-def _build_collection_summary(collection_results: list[dict[str, Any]]) -> dict[str, Any]:
-    changed_count = 0
-    unchanged_count = 0
-    status_code_counts: defaultdict[str, int] = defaultdict(int)
-    short_circuit_reason_counts: defaultdict[str, int] = defaultdict(int)
-    per_source: list[dict[str, Any]] = []
-
-    for result in collection_results:
-        changed = bool(result.get("changed"))
-        if changed:
-            changed_count += 1
-        else:
-            unchanged_count += 1
-        status_code = result.get("status_code")
-        if status_code is not None:
-            status_code_counts[str(status_code)] += 1
-        reason = str(result.get("short_circuit_reason") or ("changed" if changed else "unknown"))
-        short_circuit_reason_counts[reason] += 1
-        per_source.append(
-            {
-                "source_id": result.get("source_id"),
-                "changed": changed,
-                "short_circuit_reason": reason,
-                "status_code": status_code,
-                "record_count": result.get("record_count"),
-            }
-        )
-
-    return {
-        "source_count": len(collection_results),
-        "changed_count": changed_count,
-        "unchanged_count": unchanged_count,
-        "status_code_counts": dict(sorted(status_code_counts.items())),
-        "short_circuit_reason_counts": dict(sorted(short_circuit_reason_counts.items())),
-        "sources": per_source,
-    }
-
-
 def _iter_temp_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     if not path.exists():
         return
@@ -210,7 +172,7 @@ def _build_source_summaries(collection_results: list[dict[str, Any]]) -> list[di
 
 
 def _previous_manifest() -> dict[str, Any] | None:
-    latest_metadata = load_latest_curated_metadata()
+    latest_metadata = load_latest_curated_metadata(consistent_read=True)
     manifest_key = latest_metadata.get("manifest_key")
     if not manifest_key:
         return None

@@ -202,6 +202,55 @@ def test_handler_short_circuits_when_payload_hash_is_unchanged(monkeypatch) -> N
     assert saved["last_modified"] == "new-last-modified"
 
 
+def test_handler_skips_configured_source_host(monkeypatch) -> None:
+    source = {
+        "source_id": "tw_165_stopped_domains",
+        "display_name": "Taiwan 165 Stopped Fraud Domains",
+        "url": "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/download",
+        "metadata_url": "https://data.gov.tw/dataset/176455",
+        "license_url": "https://data.gov.tw/license",
+        "format": "csv",
+    }
+    state = {
+        "source_id": source["source_id"],
+        "last_record_count": 12,
+        "last_raw_key": "raw/tw_165_stopped_domains/prev/payload.csv",
+        "last_normalized_key": "normalized/tw_165_stopped_domains/prev/records.jsonl.gz",
+    }
+    saved: dict[str, object] = {}
+
+    monkeypatch.setattr("collect_source.SKIP_SOURCE_HOSTS", {"opdadm.moi.gov.tw"})
+    monkeypatch.setattr("collect_source.load_source_state", lambda source_id: state)
+    monkeypatch.setattr(
+        "collect_source.save_source_state",
+        lambda source_id, attributes: saved.update(attributes),
+    )
+    monkeypatch.setattr(
+        "collect_source.http_fetch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("http_fetch should not be called")),
+    )
+
+    result = handler({"source": source, "run_id": "run-skip"}, None)
+
+    assert result == {
+        "source_id": "tw_165_stopped_domains",
+        "display_name": "Taiwan 165 Stopped Fraud Domains",
+        "metadata_url": "https://data.gov.tw/dataset/176455",
+        "license_url": "https://data.gov.tw/license",
+        "changed": False,
+        "short_circuit_reason": "source_disabled",
+        "status_code": None,
+        "record_count": 12,
+        "normalized_key": "normalized/tw_165_stopped_domains/prev/records.jsonl.gz",
+        "raw_key": "raw/tw_165_stopped_domains/prev/payload.csv",
+        "requested_url": "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/download",
+        "final_url": "https://opdadm.moi.gov.tw/api/v1/no-auth/resource/download",
+        "fetched_at": result["fetched_at"],
+    }
+    assert saved["source_skip_reason"] == "configured_host_skip"
+    assert saved["source_skip_host"] == "opdadm.moi.gov.tw"
+
+
 def test_handler_short_circuits_when_records_hash_is_unchanged(monkeypatch) -> None:
     body = b"new-payload-with-different-bytes"
     source = {

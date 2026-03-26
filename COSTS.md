@@ -59,7 +59,7 @@ Region validated: `ap-east-2` / `Asia Pacific (Taipei)`
 
 Latest live publish of the run-scoped model on 2026-03-26:
 
-- execution `codex-delta-20260326053305`
+- execution `blacklist-delta-20260326053305`
 - about `121s`
 - dominated by the first full publish of `curated/runs/<run_id>/...` plus lookup-index population under the new schema
 
@@ -68,18 +68,18 @@ Latest live publish of the run-scoped model on 2026-03-26:
 Post-migration delta mode still depends on source churn:
 
 - when at least one source changes, the workflow rebuilds the current run manifest and applies delta shards to the lookup table
-- the latest live delta publish above wrote `138,209` current records and published a new latest pointer
+- the latest live delta publish above wrote `138,209` current records, advanced the authoritative DynamoDB latest pointer, and refreshed the derived S3 latest pointer
 
 ### 3. All-sources-unchanged fast path
 
 Two live control-path checks were validated on 2026-03-26:
 
 - overlap guard:
-  - execution `codex-overlap-20260326053350`
+  - execution `blacklist-overlap-20260326053350`
   - about `4.2s`
   - output ended with `skipped=true` and `skip_reason="run_in_progress"`
 - forced rebuild path:
-  - execution `codex-rebuild-20260326053440`
+  - execution `blacklist-rebuild-20260326053440`
   - about `173s`
   - all sources were unchanged, but `lookup_sync_mode="rebuild"` forced merge and full lookup reconciliation
   - rebuild deleted `48,705` stale or legacy lookup rows
@@ -122,6 +122,6 @@ The main remaining sources of avoidable cost are:
 If cost minimization becomes a priority, the next most valuable optimizations are:
 
 1. Reduce or disable X-Ray tracing if not actively used.
-2. Add explicit CloudWatch Logs retention for all Lambda log groups.
+2. Revisit the current `14`-day CloudWatch Logs retention if your cost or forensic requirements change.
 3. Revisit API Gateway type if `ap-east-2` gains stable HTTP API support and lookup traffic becomes meaningful.
 4. Add a lightweight periodic cost report or dashboard from CloudWatch metrics and Billing / Cost Explorer.
